@@ -1,0 +1,157 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function role() { return request.auth.token.get('role', 'none'); }
+    function isAdmin() { return signedIn() && role() == 'admin'; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // وصول نشط للدورة: تسجيل active ولم ينتهِ. المعرف المركب studentId_courseId
+    function hasAccess(courseId) {
+      let p = /databases/$(database)/documents/enrollments/$(request.auth.uid + '_' + courseId);
+      return signedIn() && exists(p)
+        && get(p).data.status == 'active'
+        && get(p).data.endAt > request.time;
+    }
+
+    function coursePublished(courseId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published';
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(
+             ['displayName','email','phone','role','status','guardianConsent','createdAt'])
+        && request.resource.data.role == 'student'
+        && request.resource.data.status == 'active'
+        && request.resource.data.guardianConsent == true
+        && request.resource.data.createdAt == request.time;
+      // المستخدم يعدّل بياناته غير الحساسة فقط
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName','phone','lastLoginAt']);
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // كتالوج الدورات المنشورة عام (للموقع التعريفي)
+    match /courses/{courseId} {
+      allow read: if isAdmin() || resource.data.status == 'published';
+      allow write: if isAdmin();
+
+      match /units/{unitId} {
+        allow read: if isAdmin() || coursePublished(courseId);
+        allow write: if isAdmin();
+      }
+
+      // الدروس: معاينة لأي مسجّل دخول، وغير ذلك للمشترك النشط فقط
+      match /lessons/{lessonId} {
+        allow read: if isAdmin()
+          || (signedIn() && coursePublished(courseId)
+              && (resource.data.isPreview == true || hasAccess(courseId)));
+        allow write: if isAdmin();
+      }
+    }
+
+    // التسجيلات تُكتب من Cloud Functions (Admin SDK) فقط
+    match /enrollments/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow write: if false;
+    }
+
+    match /liveSessions/{id} {
+      allow read: if isAdmin() || (signedIn() && hasAccess(resource.data.courseId));
+      allow write: if isAdmin();
+    }
+
+    // الإعلانات: العامة لأي مسجّل، والخاصة بدورة لمشتركيها فقط. النشر عبر Function فقط.
+    match /announcements/{id} {
+      allow read: if isAdmin() || (signedIn() && (
+        resource.data.audience == 'all'
+        || (resource.data.audience == 'course' && hasAccess(resource.data.courseId))));
+      allow write: if false;
+    }
+
+    match /notifications/{id} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow update: if signedIn() && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt']);
+      allow create, delete: if false;
+    }
+
+    // الإجابات النموذجية: لا يقرؤها أي عميل إطلاقًا (حتى المدير من الواجهة)
+    match /examKeys/{document=**} { allow read, write: if false; }
+
+    match /auditLogs/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // طلبات الدفع تُنشأ وتُعدَّل من Cloud Functions فقط
+    match /paymentRequests/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // الامتحانات: الأسئلة والإجابات تُكتب من Functions فقط ولا يقرؤها الطالب أبدًا
+    // (يستلم الأسئلة من startExamAttempt). النتائج تصل للطالب عبر getMyExamResults فقط.
+    match /exams/{examId} {
+      allow read: if isAdmin()
+        || (signedIn() && resource.data.published == true && hasAccess(resource.data.courseId));
+      allow write: if isAdmin();
+      match /questions/{qid} {
+        allow read: if isAdmin();
+        allow write: if false;
+      }
+    }
+
+    match /examAttempts/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      // الحفظ الدوري للإجابات فقط، أثناء المحاولة وقبل انتهائها بحسب ساعة الخادم
+      allow update: if signedIn() && resource.data.studentId == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.time < resource.data.expiresAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['answers'])
+        && request.resource.data.answers.size() <= 200;
+      allow create, delete: if false;
+    }
+
+    match /examResults/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // تقدّم الطالب (الدروس المكتملة): مستند واحد لكل طالب/دورة بمعرّف uid_courseId
+    match /progress/{id} {
+      allow read: if signedIn() && (id.matches(request.auth.uid + '_.*') || isAdmin());
+      allow create, update: if signedIn()
+        && id == request.auth.uid + '_' + request.resource.data.courseId
+        && request.resource.data.studentId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['studentId', 'courseId', 'completed', 'updatedAt'])
+        && request.resource.data.completed.size() <= 500
+        && hasAccess(request.resource.data.courseId);
+      allow delete: if false;
+    }
+
+    // الحضور اليدوي: يكتبه المدير فقط، والطالب يقرأ سجلاته
+    match /attendance/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.studentId == request.auth.uid);
+      allow create, update: if isAdmin()
+        && id == request.resource.data.sessionId + '_' + request.resource.data.studentId
+        && request.resource.data.status in ['present', 'late', 'absent']
+        && request.resource.data.method == 'manual'
+        && request.resource.data.markedBy == request.auth.uid;
+      allow delete: if isAdmin();
+    }
+
+    // إعدادات عامة (تعليمات الدفع): يقرؤها أي مسجّل، ويكتبها المدير
+    match /settings/{doc} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // أي مسار غير مذكور = مرفوض افتراضيًا.
+  }
+}
